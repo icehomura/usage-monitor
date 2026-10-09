@@ -35,7 +35,7 @@
 
         <div class="disc-actions">
           <BaseButton @click="$emit('decline')">退出</BaseButton>
-          <BaseButton variant="primary" @click="$emit('accept')">我知道了，开始使用</BaseButton>
+          <BaseButton variant="primary" @click="$emit('accept')">我已知晓</BaseButton>
         </div>
       </div>
     </div>
