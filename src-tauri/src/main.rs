@@ -974,6 +974,18 @@ fn clear_webview_cookies(app: &tauri::AppHandle) {
 }
 
 fn clear_one(w: &tauri::WebviewWindow) {
+    // httpOnly 会话 Cookie（__Host-console_session）用 cookies() 枚举不到，
+    // 但可按 URL 取到并删除——多账号串味正是漏在这里：清不净，下次登录复用旧 session。
+    for u in ["https://opencode.ai/console/", "https://opencode.ai/"] {
+        if let Ok(url) = tauri::Url::parse(u) {
+            if let Ok(list) = w.cookies_for_url(url) {
+                for c in list {
+                    let _ = w.delete_cookie(c);
+                }
+            }
+        }
+    }
+    // 兜底：常规枚举再删一遍 + 清全部浏览数据
     if let Ok(list) = w.cookies() {
         for c in list {
             let _ = w.delete_cookie(c);
