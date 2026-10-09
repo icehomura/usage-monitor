@@ -723,16 +723,24 @@ async fn open_login_window(
         return Ok(json!({ "opened": true, "existed": true, "add_new": add_new }));
     }
     let url = tauri::Url::parse(login_url).map_err(|e| format!("无效登录地址：{e}"))?;
-    tauri::WebviewWindowBuilder::new(
+    let w = tauri::WebviewWindowBuilder::new(
         &app,
         "auth",
-        tauri::WebviewUrl::External(url),
+        // 先不直接加载登录页：避免持久化的旧 session 一进页面就自动登进去、
+        // capture 抓到上一个账号的 cookie。清空后再导航到 login_url。
+        tauri::WebviewUrl::External(
+            tauri::Url::parse("about:blank").expect("about:blank is a valid url"),
+        ),
     )
     .title(format!("登录 {}", provider_id.label()))
     .inner_size(1000.0, 780.0)
     .center()
     .build()
     .map_err(|e| format!("打开登录窗口失败：{e}"))?;
+    if need_clear {
+        clear_one(&w);
+    }
+    let _ = w.navigate(url);
     set_pending_login(add_new, account_id, provider_id);
     Ok(json!({ "opened": true, "existed": false, "add_new": add_new, "provider": provider_id.as_str() }))
 }
