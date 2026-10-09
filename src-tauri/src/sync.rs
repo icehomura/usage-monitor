@@ -9,7 +9,6 @@ use crate::providers::opencode::Quota;
 use crate::providers::{AnyProvider, Credentials};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::RwLock;
 use tauri::{AppHandle, Emitter};
 
@@ -32,27 +31,88 @@ static STATUS: RwLock<Option<SyncStatus>> = RwLock::new(None);
 static QUOTAS: RwLock<Option<HashMap<String, Quota>>> = RwLock::new(None);
 static SYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// 命中限流 / 服务端错误后的冷却截止时间（毫秒时间戳）。冷却期内不再发起 API 调用。
-static COOLDOWN_UNTIL: AtomicI64 = AtomicI64::new(0);
+/// 每个账号额度的最近拉取时间（毫秒时间戳）。
+static QUOTA_FETCHED_AT: RwLock<Option<HashMap<String, i64>>> = RwLock::new(None);
 
-/// 限流后的冷却时长（秒）。
-const COOLDOWN_SECS: i64 = 120;
+/// 每个账号连续命中等退避的失败次数，用于指数退避。
+static COOLDOWN_STRIKES: RwLock<Option<HashMap<String, i32>>> = RwLock::new(None);
 
-/// 冷却剩余秒数（0 = 不在冷却）。
-pub fn cooldown_left_secs() -> i64 {
-    let left = COOLDOWN_UNTIL.load(Ordering::Relaxed) - chrono::Utc::now().timestamp_millis();
+/// 每个账号命中限流后的冷却截止时间（毫秒时间戳）。
+static COOLDOWN_UNTIL: RwLock<Option<HashMap<String, i64>>> = RwLock::new(None);
+
+/// 首次退避时长（秒），之后按指数翻倍。
+const COOLDOWN_BASE_SECS: i64 = 30;
+/// 退避上限（秒）。
+const COOLDOWN_MAX_SECS: i64 = 600;
+
+/// 某个账号的冷却剩余秒数（0 = 不在冷却）。
+pub fn cooldown_left_secs_for(account_id: &str) -> i64 {
+    let until = COOLDOWN_UNTIL
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(account_id))
+        .copied()
+        .unwrap_or(0);
+    let left = until - chrono::Utc::now().timestamp_millis();
     if left > 0 { left / 1000 + 1 } else { 0 }
 }
 
-/// 进入冷却（并说明原因）。
-fn start_cooldown(err: &str) {
-    COOLDOWN_UNTIL.store(
-        chrono::Utc::now().timestamp_millis() + COOLDOWN_SECS * 1000,
-        Ordering::Relaxed,
-    );
+/// 全局冷却：取所有账号中最长的剩余时间（用于状态展示）。
+#[allow(dead_code)] // 预留给前端显示总体冷却倒计时
+pub fn cooldown_left_secs() -> i64 {
+    let guard = COOLDOWN_UNTIL.read().unwrap_or_else(|e| e.into_inner());
+    let now = chrono::Utc::now().timestamp_millis();
+    guard
+        .as_ref()
+        .map(|m| {
+            m.values()
+                .map(|&until| (until - now).max(0) / 1000 + if until > now { 1 } else { 0 })
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0)
+}
+
+/// 进入冷却（按账号独立，指数退避）。
+fn start_cooldown(account_id: &str, err: &str) {
+    let mut guard = COOLDOWN_UNTIL.write().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+
+    let mut strikes_guard = COOLDOWN_STRIKES.write().unwrap_or_else(|e| e.into_inner());
+    let strikes_map = strikes_guard.get_or_insert_with(HashMap::new);
+    let strikes = strikes_map.entry(account_id.to_string()).or_insert(0);
+    *strikes += 1;
+
+    let secs = (COOLDOWN_BASE_SECS * (1i64 << (*strikes - 1).min(5))).min(COOLDOWN_MAX_SECS);
+    let until = chrono::Utc::now().timestamp_millis() + secs * 1000;
+    map.insert(account_id.to_string(), until);
+
     write_status(|st| {
-        st.last_error = Some(format!("{err}；已暂停请求 {COOLDOWN_SECS} 秒以降低频率"))
+        st.last_error = Some(format!("{err}；已暂停请求 {secs} 秒以降低频率"))
     });
+}
+
+/// 成功后重置退避计数器。
+fn reset_backoff(account_id: &str) {
+    if let Some(ref mut map) = *COOLDOWN_STRIKES.write().unwrap_or_else(|e| e.into_inner()) {
+        map.insert(account_id.to_string(), 0);
+    }
+    if let Some(ref mut map) = *COOLDOWN_UNTIL.write().unwrap_or_else(|e| e.into_inner()) {
+        map.remove(account_id);
+    }
+}
+
+/// 额度缓存是否仍然新鲜（相对于给定的最大存活时间毫秒）。
+pub fn quota_is_fresh(account_id: &str, max_age_ms: i64) -> bool {
+    let fetched = QUOTA_FETCHED_AT
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(account_id))
+        .copied()
+        .unwrap_or(0);
+    chrono::Utc::now().timestamp_millis() - fetched < max_age_ms
 }
 
 /// 该错误是否值得退避（限流 / 服务端错误 / 网络抖动）。
@@ -137,18 +197,23 @@ pub async fn refresh_quota(
     account: &crate::accounts::Account,
     app: Option<&AppHandle>,
 ) -> Result<Quota, String> {
-    let left = cooldown_left_secs();
+    let left = cooldown_left_secs_for(&account.id);
     if left > 0 {
         return Err(format!("限流冷却中（{left} 秒后恢复）"));
     }
     let provider = AnyProvider::for_id(account.provider);
     let q = provider.quota(&account.credentials()).await.map_err(|e| {
         if needs_backoff(&e) {
-            start_cooldown(&e);
+            start_cooldown(&account.id, &e);
         }
         e
     })?;
     set_quota_for(&account.id, Some(q.clone()));
+    reset_backoff(&account.id);
+    {
+        let mut guard = QUOTA_FETCHED_AT.write().unwrap_or_else(|e| e.into_inner());
+        guard.get_or_insert_with(HashMap::new).insert(account.id.clone(), chrono::Utc::now().timestamp_millis());
+    }
     if let Some(app) = app {
         emit(app, "quota-updated");
     }
@@ -177,7 +242,7 @@ async fn pull_request_log_pages(
             .await
             .map_err(|e| {
                 if needs_backoff(&e) {
-                    start_cooldown(&e);
+                    start_cooldown(account_id, &e);
                 }
                 e
             })?;
@@ -207,7 +272,7 @@ pub async fn sync_request_logs(
     full: bool,
     app: Option<&AppHandle>,
 ) -> Result<usize, String> {
-    let left = cooldown_left_secs();
+    let left = cooldown_left_secs_for(&account.id);
     if left > 0 {
         write_status(|st| st.source_note = format!("限流冷却中（{left}s）"));
         return Ok(0);
@@ -329,13 +394,12 @@ pub fn spawn_loop(app: AppHandle) {
         loop {
             let secs = crate::incremental_secs().max(10);
             tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
-            // 限流冷却期内不发起任何请求
-            if cooldown_left_secs() > 0 {
-                emit(&app, "sync-status");
-                continue;
-            }
             for acc in crate::accounts::list() {
                 if !acc.logged_in() {
+                    continue;
+                }
+                // 该账号在冷却中则跳过
+                if cooldown_left_secs_for(&acc.id) > 0 {
                     continue;
                 }
                 match refresh_quota(&acc, Some(&app)).await {
