@@ -782,6 +782,10 @@ async fn capture_login(app: tauri::AppHandle) -> Result<serde_json::Value, Strin
     let target_id =
         resolve_login_target(add_new, &target_id, provider_id, &org_id, label, cookie_header)?;
 
+    // 抓取成功、已存到内存/配置，立即清空 Cookie 罐：
+    // 这样下一个账号从干净态开始，不会复用本次的 session。
+    clear_one(&w);
+
     // 隐藏而非销毁：视觉上等同关闭，但保留句柄以便退出时清 Cookie 罐
     let _ = w.hide();
     Ok(json!({ "ok": true, "account_id": target_id, "org_id": org_id, "cookies": jar.len() }))
