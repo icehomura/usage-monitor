@@ -158,13 +158,21 @@ fn save_settings(base_url: String, incremental_secs: u64) -> Result<serde_json::
     Ok(json!({ "ok": true }))
 }
 
-/// 当前额度。优先读缓存；未登录或未拉取时即时请求一次。
+/// 当前额度。优先读缓存；缓存过期则即时刷新。
 #[tauri::command]
 async fn get_quota(account_id: Option<String>) -> serde_json::Value {
     let target = account_id.filter(|s| !s.trim().is_empty());
     let id = target.clone().unwrap_or_else(accounts::primary_id);
+    // 缓存有效且仍新鲜则直接返回
+    let max_age_ms = (crate::incremental_secs() as i64).max(10) * 2000; // 2 倍同步间隔
     if let Some(q) = sync::quota_for(&id) {
-        return json!({ "available": true, "quota": q, "account_id": id });
+        if sync::quota_is_fresh(&id, max_age_ms) {
+            return json!({ "available": true, "quota": q, "account_id": id });
+        }
+        // 缓存过期，尝试刷新（冷却中则仍返回旧缓存）
+        if sync::cooldown_left_secs_for(&id) > 0 {
+            return json!({ "available": true, "quota": q, "account_id": id });
+        }
     }
     let acc = match accounts::find(&id) {
         Some(a) => a,
@@ -172,7 +180,14 @@ async fn get_quota(account_id: Option<String>) -> serde_json::Value {
     };
     match sync::refresh_quota(&acc, None).await {
         Ok(q) => json!({ "available": true, "quota": q, "account_id": id }),
-        Err(e) => json!({ "available": false, "reason": e, "account_id": id }),
+        Err(e) => {
+            // 刷新失败时，若有旧缓存则返回旧数据
+            if let Some(q) = sync::quota_for(&id) {
+                json!({ "available": true, "quota": q, "account_id": id })
+            } else {
+                json!({ "available": false, "reason": e, "account_id": id })
+            }
+        }
     }
 }
 
